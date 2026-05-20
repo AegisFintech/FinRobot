@@ -85,7 +85,7 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     # Smoothed averages
     df['atr'] = df['tr'].ewm(alpha=1/period, adjust=False).mean()
     df['plus_di'] = 100 * (df['plus_dm'].ewm(alpha=1/period, adjust=False).mean() / df['atr'])
-    df['minus_di'] = 100 * (df['minus_di'].ewm(alpha=1/period, adjust=False).mean() / df['atr'])
+    df['minus_di'] = 100 * (df['minus_dm'].ewm(alpha=1/period, adjust=False).mean() / df['atr'])
     
     # DX and ADX
     df['dx'] = 100 * abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di'])
@@ -97,7 +97,7 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     return df
 
 
-def build_trend_signals_from_m1(m1: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
+def build_trend_signals_from_m1(m1: pd.DataFrame, cfg: BacktestConfig = None) -> pd.DataFrame:
     """
     Build 1m trade signals using 5m EMA(8/21) trend filter with ADX confirmation.
     
@@ -107,6 +107,8 @@ def build_trend_signals_from_m1(m1: pd.DataFrame, cfg: BacktestConfig) -> pd.Dat
     - More robust data handling
     """
     df = m1.copy()
+    if cfg is None:
+        cfg = BacktestConfig()
     
     # Handle index being datetime
     if isinstance(df.index, pd.DatetimeIndex):
@@ -157,9 +159,9 @@ def build_trend_signals_from_m1(m1: pd.DataFrame, cfg: BacktestConfig) -> pd.Dat
     )
     
     # Forward fill missing values
-    merged["ema_fast"] = merged["ema_fast"].fillna(method="ffill")
-    merged["ema_slow"] = merged["ema_slow"].fillna(method="ffill")
-    merged["adx"] = merged["adx"].fillna(method="ffill").fillna(0)
+    merged["ema_fast"] = merged["ema_fast"].ffill()
+    merged["ema_slow"] = merged["ema_slow"].ffill()
+    merged["adx"] = merged["adx"].ffill().fillna(0)
     
     # Generate signals with ADX filter
     merged["signal"] = 0

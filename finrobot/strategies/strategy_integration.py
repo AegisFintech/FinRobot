@@ -113,7 +113,7 @@ PARAMETER_SPACES = {
 # BACKTEST RUNNER
 # ============================================================================
 
-def run_strategy_backtest(strategy_name: str, df: pd.DataFrame, params: Dict[str, Any] -> dict:
+def run_strategy_backtest(strategy_name: str, df: pd.DataFrame, params: Dict[str, Any]) -> dict:
     """
     Run a single backtest for the specified strategy.
     

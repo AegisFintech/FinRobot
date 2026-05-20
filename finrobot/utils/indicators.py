@@ -3,8 +3,14 @@ from __future__ import annotations
 import pandas as pd
 import numpy as np
 
-from .smart_money import enrich_smart_money
-from .harmonics import enrich_harmonics
+try:
+    from .smart_money import enrich_smart_money
+except ImportError:
+    from finrobot.strategies.smart_money import enrich_smart_money
+try:
+    from .harmonics import enrich_harmonics
+except ImportError:
+    from finrobot.strategies.harmonics import enrich_harmonics
 
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:

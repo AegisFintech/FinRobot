@@ -7,7 +7,7 @@ import json
 import time
 import logging
 from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, date
 from collections import deque
 import threading
@@ -112,6 +112,25 @@ class TradeRecord:
             'entry_datetime': datetime.fromtimestamp(self.entry_time).isoformat(),
             'exit_datetime': datetime.fromtimestamp(self.exit_time).isoformat()
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'TradeRecord':
+        return cls(
+            trade_id=data['trade_id'],
+            symbol=data['symbol'],
+            side=data['side'],
+            entry_time=float(data['entry_time']),
+            exit_time=float(data['exit_time']),
+            entry_price=float(data['entry_price']),
+            exit_price=float(data['exit_price']),
+            size=float(data['size']),
+            leverage=float(data['leverage']),
+            pnl=float(data['pnl']),
+            pnl_pct=float(data.get('pnl_pct', 0.0)),
+            exit_reason=data.get('exit_reason', ''),
+            fees=float(data.get('fees', 0.0)),
+            strategy=data.get('strategy', ''),
+        )
 
 
 class StateManager:
@@ -273,6 +292,18 @@ class StateManager:
                             self.daily_stats.update(loaded_stats)
 
                         logger.info(f"Loaded state: balance={self.balance:.2f}, equity={self.equity:.2f}")
+
+            if os.path.exists(self.trades_file):
+                with open(self.trades_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            self.trade_history.append(TradeRecord.from_dict(json.loads(line)))
+                        except Exception as e:
+                            logger.debug(f"Skipping bad trade history row: {e}")
+                logger.info(f"Loaded {len(self.trade_history)} historical trades from disk")
 
         except json.JSONDecodeError as e:
             logger.error(f"Corrupt state file, resetting to defaults: {e}")

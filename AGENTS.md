@@ -234,9 +234,12 @@ V10 had regime SL/TP of ranging 0.4%/0.6%, mild 0.6%/1.1%, trending 0.7%/1.4% wi
 ### 19. TIMEOUT and Early Profit Exit Are the #1 and #2 EV Killers (CRITICAL)
 V12 data: 173 trades, 105 (61%) exited via TIMEOUT with avg PnL -0.028. Early profit exit captured 57 wins but avg only +0.051. The fundamental problem: TIMEOUT exits at random PnL destroy expected value because they're noise, not alpha. Early profit exit at +0.15% cuts winners before they can reach TP at +0.6-1.2%. The win/loss ratio was 0.72 (avg win +0.034 vs avg loss -0.048). Quant principle: you need either WR>60% with R:R>0.8, or R:R>1.5 with WR>40%. V13 disables both TIMEOUT and early profit exit. Trades now exit only via SL (cut losers), TP (let winners run), or trailing stop (lock in profits). This eliminates two sources of negative EV.
 
+### 20. V14 Technical Fixes Before Further Strategy Tuning
+V14 fixed live Hyperliquid SDK initialization (use `eth_account.Account.from_key` + `Exchange(local_account, api_url, account_address=...)`), live `market_close` signature, startup candle bootstrap via Hyperliquid `candleSnapshot`, stale StateManager positions on close, historical `trades.jsonl` loading, paper stats double-counting, and missing runtime deps (`websocket-client`, `hyperliquid-python-sdk`, `eth-account`). New env risk controls: `MAX_LEVERAGE`, `RISK_PER_TRADE_PCT`, `MIN_CONFIDENCE`, `MAX_OPEN_POSITIONS`, `TRADE_COOLDOWN_SECONDS`, `MAX_POSITION_DURATION_SECONDS`, `DAILY_LOSS_LIMIT_PCT`, `MAX_DRAWDOWN_PCT`. See `docs/V14_PROFITABILITY_AUDIT.md`.
+
 ---
 
-**Last Updated**: 2026-05-19
-**Major Changes**: V13 - Disabled TIMEOUT exit entirely (was causing 61% of trades to exit at random PnL, destroying EV), disabled early profit exit (was cutting winners at +0.15% before TP could be hit), raised min_confidence 0.65→0.70, raised breakeven activation +0.3%→+0.5%, raised trail activation 0.3%→0.4%, disabled partial TP, reduced max positions 5→3, increased trade cooldown 5s→15s, reduced high-conf boost 1.5x→1.3x at >=80%. Core quant principle: let winners run to TP, cut losers at SL, eliminate noise exits.
-**Daemon 2 Status**: Running via nohup (V13)
+**Last Updated**: 2026-05-20
+**Major Changes**: V14 - Fixed live Hyperliquid executor, bootstrapped historical candles, cleaned position/state accounting, made risk knobs env-driven with safer live defaults, fixed test/runtime import issues. V13 trading principle remains: let winners run to TP/trail, cut losers at SL, avoid random timeout exits unless explicitly configured.
+**Daemon 2 Status**: V14 code smoke-tested locally in paper mode; AWS instance still needs SSH/log verification and restart.
 **Daemon 1 Status**: Preserved but not actively used (all strategies unprofitable)

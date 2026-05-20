@@ -62,6 +62,34 @@ def _log_error(msg: str, cfg: HFTConfig):
     logger.error(msg)
 
 
+@dataclass
+class TrendMartingaleConfig:
+    base_lot: float = 0.01
+    multiplier: float = 2.0
+    max_steps: int = 3
+
+
+def next_martingale_lot(loss_count: int, cfg: TrendMartingaleConfig) -> tuple[int, float]:
+    step = min(loss_count, cfg.max_steps)
+    return step, cfg.base_lot * (cfg.multiplier ** step)
+
+
+def trend_signal_1m_with_5m_filter(m1: pd.DataFrame, m5: pd.DataFrame) -> int:
+    if m1.empty or m5.empty or "close" not in m1 or "close" not in m5:
+        return 0
+    m5_close = m5["close"].astype(float)
+    m1_close = m1["close"].astype(float)
+    if len(m5_close) < 2 or len(m1_close) < 2:
+        return 0
+    m5_trend = 1 if m5_close.iloc[-1] >= m5_close.iloc[0] else -1
+    m1_momentum = 1 if m1_close.iloc[-1] >= m1_close.iloc[0] else -1
+    if m5_trend == 1 and m1_momentum == 1:
+        return 1
+    if m1_momentum == -1:
+        return -1
+    return 0
+
+
 def prepare_data(df: pd.DataFrame, cfg: HFTConfig) -> pd.DataFrame:
     """Prepare and validate data for HFT backtest."""
     df = df.copy()
@@ -190,7 +218,7 @@ def calculate_signals(df: pd.DataFrame, cfg: HFTConfig) -> pd.DataFrame:
     return df
 
 
-def backtest_hft(df_input: pd.DataFrame, cfg: HFTConfig) -> dict:
+def _backtest_hft_core(df_input: pd.DataFrame, cfg: HFTConfig) -> dict:
     """
     High-frequency trading backtest with momentum and microstructure signals.
     
@@ -497,4 +525,4 @@ def backtest_hft(df_input: pd.DataFrame, cfg: HFTConfig = None) -> dict:
 
 
 # Alias for backward compatibility
-backtest_hft_impl = backtest_hft
+backtest_hft_impl = _backtest_hft_core

@@ -392,6 +392,32 @@ class CandleBuilder:
         self.current_candle: Dict[str, Dict] = {}
         self.last_tick: Dict[str, float] = {}
 
+    def load_historical(self, coin: str, candles: List[Dict]):
+        normalized = []
+        for candle in candles:
+            try:
+                open_time = float(candle.get("open_time", candle.get("time", 0)))
+                normalized.append({
+                    "open_time": open_time,
+                    "open": float(candle["open"]),
+                    "high": float(candle["high"]),
+                    "low": float(candle["low"]),
+                    "close": float(candle["close"]),
+                    "volume": float(candle.get("volume", 0.0)),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+        normalized.sort(key=lambda x: x["open_time"])
+        if normalized:
+            self.candles[coin] = normalized[-1000:]
+            last = normalized[-1]
+            current_start = int(time.time() // self.timeframe_seconds) * self.timeframe_seconds
+            if last["open_time"] >= current_start:
+                self.candles[coin] = normalized[:-1][-1000:]
+                self.current_candle[coin] = last.copy()
+            else:
+                self.current_candle.pop(coin, None)
+
     def update(self, coin: str, price: float, volume: float = 0.0):
         now = time.time()
         candle_start = int(now // self.timeframe_seconds) * self.timeframe_seconds
@@ -467,13 +493,14 @@ class MoonshotDaemon:
         if not paper_trading:
             trading_mode = "live"
         self.paper_trading = trading_mode == "paper"
+        configured_max_leverage = float(os.getenv("MAX_LEVERAGE", os.getenv("LIVE_MAX_LEVERAGE", "3" if not self.paper_trading else "5")))
 
         if self.paper_trading:
             self.trading_engine = HyperliquidPaperTrading(
                 initial_balance=initial_balance,
                 symbols=self.symbols,
-                default_leverage=5.0,
-                max_leverage=5.0,
+                default_leverage=min(5.0, configured_max_leverage),
+                max_leverage=configured_max_leverage,
             )
         else:
             from moonshot.strategies.live_executor import HyperliquidLiveTrading
@@ -488,8 +515,8 @@ class MoonshotDaemon:
                 self.trading_engine = HyperliquidPaperTrading(
                     initial_balance=initial_balance,
                     symbols=self.symbols,
-                    default_leverage=5.0,
-                    max_leverage=5.0,
+                    default_leverage=min(5.0, configured_max_leverage),
+                    max_leverage=configured_max_leverage,
                 )
             else:
                 self.trading_engine = HyperliquidLiveTrading(
@@ -498,8 +525,8 @@ class MoonshotDaemon:
                     network=network,
                     initial_balance=initial_balance,
                     symbols=self.symbols,
-                    default_leverage=5.0,
-                    max_leverage=5.0,
+                    default_leverage=configured_max_leverage,
+                    max_leverage=configured_max_leverage,
                     max_position_usd=max_pos,
                 )
 
@@ -563,18 +590,18 @@ class MoonshotDaemon:
         self._last_funding_fetch = 0.0
         self._funding_fetch_interval = 300
 
-        self.max_open_positions = 3
-        self.max_risk_per_trade_pct = 0.01
+        self.max_open_positions = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+        self.max_risk_per_trade_pct = float(os.getenv("RISK_PER_TRADE_PCT", "0.005"))
         self.stop_loss_pct = 0.007
         self.take_profit_pct = 0.014
         self.trailing_stop_pct = 0.004
-        self.max_drawdown_pct = 0.50
-        self.max_position_duration = 2400
+        self.max_drawdown_pct = float(os.getenv("MAX_DRAWDOWN_PCT", "0.25"))
+        self.max_position_duration = int(os.getenv("MAX_POSITION_DURATION_SECONDS", "0"))
         self.stale_position_threshold = 999999
         self.stale_pnl_threshold = 0.001
-        self.min_confidence = 0.65
-        self.max_leverage = 5.0
-        self.trade_cooldown = 15
+        self.min_confidence = float(os.getenv("MIN_CONFIDENCE", "0.72"))
+        self.max_leverage = configured_max_leverage
+        self.trade_cooldown = float(os.getenv("TRADE_COOLDOWN_SECONDS", "15"))
         self._last_trade_time = 0.0
         self.use_atr_sl_tp = False
         self.atr_sl_mult = 7.0
@@ -589,10 +616,10 @@ class MoonshotDaemon:
             "unknown": {"sl": 0.004, "tp": 0.009, "trail": 0.003},
         }
         self.regime_timeout = {
-            "ranging": 3600,
-            "mild_trend": 3600,
-            "trending": 3600,
-            "unknown": 3600,
+            "ranging": self.max_position_duration,
+            "mild_trend": self.max_position_duration,
+            "trending": self.max_position_duration,
+            "unknown": self.max_position_duration,
         }
         self.per_asset_sl_tp = {
             "BTC": {"sl": 0.005, "tp": 0.012, "trail": 0.004},
@@ -622,7 +649,7 @@ class MoonshotDaemon:
         self.early_profit_min_age = 300
 
         self.high_confidence_threshold = 0.80
-        self.high_confidence_risk_mult = 1.3
+        self.high_confidence_risk_mult = 1.0 if not self.paper_trading else 1.15
 
         self.partial_tp_rr = 1.5
 
@@ -657,10 +684,10 @@ class MoonshotDaemon:
         self.funding_rates: Dict[str, float] = {}
         self._daily_pnl: float = 0.0
         self._daily_pnl_date: str = ""
-        self._daily_loss_limit: float = 0.02
+        self._daily_loss_limit: float = float(os.getenv("DAILY_LOSS_LIMIT_PCT", os.getenv("LIVE_DAILY_LOSS_LIMIT", "1.0"))) / 100.0
 
         logger.info("=" * 70)
-        logger.info("MOONSHOT DAEMON INITIALIZED - V13")
+        logger.info("MOONSHOT DAEMON INITIALIZED - V14")
         logger.info("=" * 70)
         logger.info(f"  Initial Balance: {initial_balance} USDT")
         logger.info(f"  Symbols: {', '.join(self.symbols)}")
@@ -672,7 +699,7 @@ class MoonshotDaemon:
         logger.info(f"  ATR SL/TP: {'ON' if self.use_atr_sl_tp else 'OFF'} | SL: {self.stop_loss_pct*100:.2f}%-{self.max_sl_pct*100:.2f}% | TP: {self.take_profit_pct*100:.2f}%-{self.max_tp_pct*100:.2f}% | Trail: {self.trailing_stop_pct*100:.2f}%")
         logger.info(f"  Coin Vol Mult: {self.coin_vol_mult}")
         logger.info(f"  MinConf: {self.min_confidence} | Cooldown: {self.trade_cooldown}s | MaxPos: {self.max_open_positions}")
-        logger.info(f"  Timeout: 3600s | Strategies: {len(self.strategies)}")
+        logger.info(f"  Timeout: {'OFF' if self.max_position_duration <= 0 else str(self.max_position_duration) + 's'} | Strategies: {len(self.strategies)}")
         logger.info(f"  Regime SL/TP: ranging={self.regime_sl_tp['ranging']} | mild_trend={self.regime_sl_tp['mild_trend']} | trending={self.regime_sl_tp['trending']}")
         logger.info(f"  Regime Timeout: ranging={self.regime_timeout['ranging']}s | mild_trend={self.regime_timeout['mild_trend']}s | trending={self.regime_timeout['trending']}s")
         logger.info(f"  EarlyProfitExit: {'ON' if self.early_profit_exit else 'OFF'} (>{self.early_profit_min_pct*100:.2f}% after {self.early_profit_min_age}s)")
@@ -726,6 +753,68 @@ class MoonshotDaemon:
 
         logger.info("All components initialized")
 
+    def _bootstrap_historical_candles(self):
+        logger.info("Bootstrapping historical candles from Hyperliquid...")
+        now_ms = int(time.time() * 1000)
+        interval_ms = 60_000
+        start_ms = now_ms - (240 * interval_ms)
+        for coin in [s.replace("-PERP", "") for s in self.symbols]:
+            candles_1m = self._fetch_candle_snapshot(coin, "1m", start_ms, now_ms)
+            if candles_1m:
+                self.candle_builder.load_historical(coin, candles_1m)
+                logger.info(f"  Loaded {len(candles_1m)} 1m candles for {coin}")
+            candles_5m = self._aggregate_candles(candles_1m, 300) if candles_1m else []
+            if candles_5m:
+                self.candle_builder_5m.load_historical(coin, candles_5m)
+                logger.info(f"  Loaded {len(candles_5m)} 5m candles for {coin}")
+
+    def _fetch_candle_snapshot(self, coin: str, interval: str, start_ms: int, end_ms: int) -> List[Dict]:
+        try:
+            import urllib.request
+            url = "https://api.hyperliquid.xyz/info"
+            payload = json.dumps({
+                "type": "candleSnapshot",
+                "req": {"coin": coin, "interval": interval, "startTime": start_ms, "endTime": end_ms},
+            }).encode()
+            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            candles = []
+            for row in data if isinstance(data, list) else []:
+                candles.append({
+                    "open_time": float(row["t"]) / 1000.0,
+                    "open": float(row["o"]),
+                    "high": float(row["h"]),
+                    "low": float(row["l"]),
+                    "close": float(row["c"]),
+                    "volume": float(row.get("v", 0.0)),
+                })
+            return candles
+        except Exception as e:
+            logger.warning(f"Failed to bootstrap candles for {coin}: {e}")
+            return []
+
+    def _aggregate_candles(self, candles: List[Dict], timeframe_seconds: int) -> List[Dict]:
+        buckets: Dict[int, Dict] = {}
+        for candle in candles:
+            bucket = int(candle["open_time"] // timeframe_seconds) * timeframe_seconds
+            if bucket not in buckets:
+                buckets[bucket] = {
+                    "open_time": bucket,
+                    "open": candle["open"],
+                    "high": candle["high"],
+                    "low": candle["low"],
+                    "close": candle["close"],
+                    "volume": candle.get("volume", 0.0),
+                }
+            else:
+                target = buckets[bucket]
+                target["high"] = max(target["high"], candle["high"])
+                target["low"] = min(target["low"], candle["low"])
+                target["close"] = candle["close"]
+                target["volume"] += candle.get("volume", 0.0)
+        return [buckets[key] for key in sorted(buckets)]
+
     def _on_price_update(self, update: PriceUpdate):
         coin = update.coin
         self.current_prices[coin] = update.mid
@@ -766,7 +855,9 @@ class MoonshotDaemon:
             logger.debug(f"Failed to fetch funding rates: {e}")
 
     def _on_trade(self, trade: TradeData):
-        pass
+        if trade.px > 0 and trade.sz > 0:
+            self.candle_builder.update(trade.coin, trade.px, trade.sz)
+            self.candle_builder_5m.update(trade.coin, trade.px, trade.sz)
 
     def _on_ws_connect(self):
         logger.info("WebSocket connected to Hyperliquid")
@@ -960,7 +1051,7 @@ class MoonshotDaemon:
             should_close_tp = current_price >= pos_tp
             trailing_stop = highest - pos_trail
             should_close_trail = current_price < trailing_stop and highest > pos.entry_price * (1 + self.trail_activation_pct)
-            should_close_timeout = position_age > regime_timeout
+            should_close_timeout = regime_timeout > 0 and position_age > regime_timeout
         else:
             pnl_pct = (pos.entry_price - current_price) / pos.entry_price
             risk_distance = abs(pos.entry_price - pos_sl)
@@ -968,7 +1059,7 @@ class MoonshotDaemon:
             should_close_tp = current_price <= pos_tp
             trailing_stop = lowest + pos_trail
             should_close_trail = current_price > trailing_stop and lowest < pos.entry_price * (1 - self.trail_activation_pct)
-            should_close_timeout = position_age > regime_timeout
+            should_close_timeout = regime_timeout > 0 and position_age > regime_timeout
 
         should_close_early_profit = False
         if self.early_profit_exit and pnl_pct >= self.early_profit_min_pct and position_age >= self.early_profit_min_age:
@@ -1044,6 +1135,8 @@ class MoonshotDaemon:
             )
 
             self._record_trade_to_state(coin, pos, realized, reason)
+            if self.state_manager:
+                self.state_manager.remove_position(symbol)
 
             today = datetime.now().strftime("%Y-%m-%d")
             if today != self._daily_pnl_date:
@@ -1175,7 +1268,7 @@ class MoonshotDaemon:
         if today != self._daily_pnl_date:
             self._daily_pnl = 0.0
             self._daily_pnl_date = today
-        if self._daily_pnl < -(balance * self._daily_loss_limit):
+        if self._daily_pnl < -(self.initial_balance * self._daily_loss_limit):
             logger.warning(f"Daily loss limit hit ({self._daily_pnl:.4f} USDT), pausing new trades for today")
             return
 
@@ -1285,12 +1378,28 @@ class MoonshotDaemon:
         for coin, (signal, strategy_name, confidence) in sorted_signals:
             if executed >= available_slots:
                 break
-            if time.time() - self._last_trade_time < self.trade_cooldown:
+            if executed == 0 and time.time() - self._last_trade_time < self.trade_cooldown:
                 logger.info(f"  Trade cooldown active ({self.trade_cooldown}s), skipping")
                 break
             if confidence >= self.min_confidence:
-                if not self._check_trend_filter(signal, coin):
+                test_signal = TradingSignal(
+                    symbol=signal.symbol,
+                    signal_type=signal.signal_type,
+                    confidence=signal.confidence,
+                    suggested_leverage=signal.suggested_leverage,
+                    suggested_size=signal.suggested_size,
+                    entry_price=signal.entry_price,
+                    stop_loss=signal.stop_loss,
+                    take_profit=signal.take_profit,
+                    rationale=signal.rationale,
+                    timestamp=signal.timestamp,
+                )
+                if not self._check_trend_filter(test_signal, coin):
                     logger.info(f"  Skipping {coin} {signal.signal_type.value}: counter-trend filter rejected (conf fell below min)")
+                    continue
+                signal.confidence = test_signal.confidence
+                if signal.confidence < self.min_confidence:
+                    logger.info(f"  Skipping {coin}: trend-adjusted confidence {signal.confidence:.2f} < {self.min_confidence:.2f}")
                     continue
                 if signal.signal_type == SignalType.BUY and open_long_count >= max_correlated:
                     logger.info(f"  Skipping {coin} LONG: correlation limit ({open_long_count}/{max_correlated} long)")
@@ -1298,7 +1407,7 @@ class MoonshotDaemon:
                 if signal.signal_type == SignalType.SELL and open_short_count >= max_correlated:
                     logger.info(f"  Skipping {coin} SHORT: correlation limit ({open_short_count}/{max_correlated} short)")
                     continue
-                self._execute_signal(signal, strategy_name=strategy_name)
+                self._execute_signal(signal, strategy_name=strategy_name, skip_trend_filter=True)
                 executed += 1
                 self._last_trade_time = time.time()
                 if signal.signal_type == SignalType.BUY:
@@ -1533,6 +1642,8 @@ class MoonshotDaemon:
         self.running = True
         self.iteration_count = 0
 
+        self._bootstrap_historical_candles()
+
         if self.ws_client:
             self.ws_client.start()
 
@@ -1550,8 +1661,9 @@ class MoonshotDaemon:
             logger.info("WebSocket connected, starting main loop")
 
         warmup_start = time.time()
-        logger.info("Warming up price data (120s for 60s candles)...")
-        while self.running and time.time() - warmup_start < 120:
+        warmup_seconds = 10 if all(len(self.candle_builder.candles.get(c, [])) >= 30 for c in [s.replace("-PERP", "") for s in self.symbols]) else 120
+        logger.info(f"Warming up price data ({warmup_seconds}s)...")
+        while self.running and time.time() - warmup_start < warmup_seconds:
             time.sleep(1)
         logger.info(f"Warmup done. Prices: {len(self.current_prices)} coins")
 

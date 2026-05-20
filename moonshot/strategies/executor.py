@@ -318,7 +318,6 @@ class HyperliquidPaperTrading:
         }
         
         self.trade_history.append(trade)
-        self.stats['total_trades'] += 1
         
         # Log execution
         side_emoji = "🟢" if order.side == OrderSide.BUY else "🔴"
@@ -389,19 +388,20 @@ class HyperliquidPaperTrading:
         
         # Place closing order
         close_side = OrderSide.SELL if pos.side == OrderSide.BUY else OrderSide.BUY
-        
+        entry_size = pos.size
+
         order = self.place_order(
             symbol=symbol,
             side=close_side,
-            size=pos.size,
+            size=entry_size,
             order_type=order_type,
             leverage=pos.leverage
         )
         
         # Calculate realized PnL
-        current_price = self.current_prices.get(symbol, pos.entry_price)
-        realized_pnl = pos.calculate_unrealized_pnl(current_price)
-        
+        realized_pnl = pos.calculate_unrealized_pnl(order.average_fill_price or self.current_prices.get(symbol, pos.entry_price))
+
+        self.stats['total_trades'] += 1
         self.stats['total_pnl'] += realized_pnl
         if realized_pnl > 0:
             self.stats['winning_trades'] += 1
