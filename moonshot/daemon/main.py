@@ -660,6 +660,22 @@ class MoonshotDaemon:
             "unknown": 1.0,
         }
 
+        self.adaptive_exits_enabled = os.getenv("ADAPTIVE_EXITS_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+        self.chandelier_atr_mult = float(os.getenv("CHANDELIER_ATR_MULT", "2.5"))
+        if os.getenv("PARTIAL_TP_AT_1R", "false").lower() in ("1", "true", "yes", "on"):
+            self.partial_tp_rr = 1.0
+        if self.adaptive_exits_enabled:
+            self.partial_tp_enabled = True
+            self.breakeven_stop_enabled = True
+        self.regime_gate_enabled = os.getenv("REGIME_GATE_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+        self.regime_gate_min_trades = int(os.getenv("REGIME_GATE_MIN_TRADES", "20"))
+        self.regime_gate_min_expected_R = float(os.getenv("REGIME_GATE_MIN_EXPECTED_R", "0.05"))
+        self.regime_gate_min_wr = float(os.getenv("REGIME_GATE_MIN_WR", "0.40"))
+        self.regime_gate_grace_trades = int(os.getenv("REGIME_GATE_GRACE_TRADES", "30"))
+
+        self.position_sl_at_entry: Dict[str, float] = {}
+        self.position_entry_atr: Dict[str, float] = {}
+
         self.strategy_coin_blacklist = {
             "Fibonacci_Retracement": {"SOL"},
             "MACD_Divergence": {"SOL", "ETH"},
@@ -710,6 +726,17 @@ class MoonshotDaemon:
         logger.info(f"  BreakevenStop: {'ON' if self.breakeven_stop_enabled else 'OFF'} (activate at {self.breakeven_activation_pct*100:.1f}%) | TrailActivation: {self.trail_activation_pct*100:.1f}%")
         logger.info(f"  DailyLossLimit: -{self._daily_loss_limit*100:.1f}% | CorrelationCheck: ON")
         logger.info(f"  RegimeDetection: ON | FundingRateData: {'via WS' if True else 'OFF'}")
+        logger.info(
+            f"  AdaptiveExits: {'ON' if self.adaptive_exits_enabled else 'OFF'}"
+            f" (Chandelier x{self.chandelier_atr_mult} ATR, PartialTP@{self.partial_tp_rr}R)"
+        )
+        logger.info(
+            f"  RegimeGate: {'ON' if self.regime_gate_enabled else 'OFF'}"
+            f" (min_trades={self.regime_gate_min_trades},"
+            f" min_R={self.regime_gate_min_expected_R},"
+            f" min_wr={self.regime_gate_min_wr},"
+            f" grace={self.regime_gate_grace_trades})"
+        )
         logger.info("=" * 70)
 
     def initialize(self):
@@ -1028,6 +1055,16 @@ class MoonshotDaemon:
             pos_trail = pos.entry_price * trail_pct
             self.position_trail[coin] = pos_trail
 
+        if self.adaptive_exits_enabled:
+            atr_val = self.position_entry_atr.get(coin)
+            if atr_val is None or atr_val <= 0:
+                atr_val = self._calculate_atr(coin)
+                if atr_val and atr_val > 0:
+                    self.position_entry_atr[coin] = atr_val
+            if atr_val and atr_val > 0:
+                pos_trail = atr_val * self.chandelier_atr_mult
+                self.position_trail[coin] = pos_trail
+
         if self.breakeven_stop_enabled and coin not in self._breakeven_hit:
             if pos.side == OrderSide.BUY and current_price >= pos.entry_price * (1 + self.breakeven_activation_pct):
                 be_price = pos.entry_price * 1.0005
@@ -1073,6 +1110,12 @@ class MoonshotDaemon:
                     if partial_size > 0 and pos.size - partial_size > 0:
                         self._partial_closed[coin] = True
                         self._do_partial_close(symbol, coin, partial_size, current_price, "PARTIAL_TP")
+                        if self.adaptive_exits_enabled:
+                            be_price = pos.entry_price * 1.0005
+                            if be_price > pos_sl:
+                                pos_sl = be_price
+                                self.position_sl[coin] = pos_sl
+                            self._breakeven_hit[coin] = True
             else:
                 partial_tp_price = pos.entry_price - risk_distance * self.partial_tp_rr
                 if current_price <= partial_tp_price:
@@ -1080,6 +1123,12 @@ class MoonshotDaemon:
                     if partial_size > 0 and pos.size - partial_size > 0:
                         self._partial_closed[coin] = True
                         self._do_partial_close(symbol, coin, partial_size, current_price, "PARTIAL_TP")
+                        if self.adaptive_exits_enabled:
+                            be_price = pos.entry_price * 0.9995
+                            if be_price < pos_sl:
+                                pos_sl = be_price
+                                self.position_sl[coin] = pos_sl
+                            self._breakeven_hit[coin] = True
 
         should_close_drift = False
         if self.stale_drift_exit and position_age > self.stale_drift_min_age:
@@ -1127,6 +1176,10 @@ class MoonshotDaemon:
                 del self._partial_closed[coin]
             if coin in self.position_regime:
                 del self.position_regime[coin]
+            if coin in self.position_sl_at_entry:
+                del self.position_sl_at_entry[coin]
+            if coin in self.position_entry_atr:
+                del self.position_entry_atr[coin]
 
             emoji = "+" if realized > 0 else ""
             logger.info(
@@ -1174,6 +1227,16 @@ class MoonshotDaemon:
             else:
                 pnl_pct_val = 0.0
 
+            entry_sl = self.position_sl_at_entry.get(coin)
+            if entry_sl is None or entry_sl <= 0:
+                entry_sl = self.position_sl.get(coin)
+            if entry_sl and pos.size > 0:
+                risk_amount = abs(pos.entry_price - entry_sl) * pos.size
+            else:
+                risk_amount = 0.0
+            r_multiple = (total_realized / risk_amount) if risk_amount > 1e-9 else 0.0
+            trade_regime = self.position_regime.get(coin, self._detect_market_regime(coin))
+
             trade = TradeRecord(
                 trade_id=f"T{int(time.time()*1000)}",
                 symbol=f"{coin}-PERP",
@@ -1201,6 +1264,9 @@ class MoonshotDaemon:
                     pnl_pct=pnl_pct_val,
                     exit_reason=reason,
                     duration=time.time() - pos.timestamp,
+                    risk_amount=risk_amount,
+                    r_multiple=r_multiple,
+                    regime=trade_regime,
                 )
         except Exception as e:
             logger.error(f"Error recording trade: {e}")
@@ -1321,6 +1387,8 @@ class MoonshotDaemon:
                 if sname in self.strategy_coin_blacklist and coin in self.strategy_coin_blacklist[sname]:
                     continue
                 if regime_allowed and sname not in regime_allowed:
+                    continue
+                if not self._strategy_passes_regime_gate(sname, regime, coin):
                     continue
                 try:
                     kwargs = {}
@@ -1570,6 +1638,10 @@ class MoonshotDaemon:
             self.position_entry_time[coin] = time.time()
             self.position_sl[coin] = stop_price
             self.position_tp[coin] = take_profit
+            self.position_sl_at_entry[coin] = stop_price
+            atr_at_entry = self._calculate_atr(coin)
+            if atr_at_entry and atr_at_entry > 0:
+                self.position_entry_atr[coin] = atr_at_entry
             self.position_regime[coin] = regime
             if self.use_atr_sl_tp:
                 _, _, trail_distance = self._get_atr_sl_tp(coin, current_price, signal.signal_type)
@@ -1635,6 +1707,27 @@ class MoonshotDaemon:
                     return False
 
         return True
+
+    def _strategy_passes_regime_gate(self, sname: str, regime: str, coin: str) -> bool:
+        if not self.regime_gate_enabled or not self._strategy_tracker:
+            return True
+        total_trades = len(self._strategy_tracker.trades.get(sname, []))
+        if total_trades < self.regime_gate_grace_trades:
+            return True
+        ok, edge = self._strategy_tracker.edge_passes_hurdle(
+            sname,
+            regime=regime,
+            min_trades=self.regime_gate_min_trades,
+            min_expected_R=self.regime_gate_min_expected_R,
+            min_win_rate=self.regime_gate_min_wr,
+        )
+        if not ok:
+            logger.info(
+                f"  RegimeGate blocked {sname} on {coin}/{regime}: "
+                f"n={int(edge['n'])} wr={edge['wr_mean']:.2f} "
+                f"E[R]={edge['expected_R_mean']:.3f}"
+            )
+        return ok
 
     def run(self):
         logger.info("Starting Moonshot Daemon main loop")

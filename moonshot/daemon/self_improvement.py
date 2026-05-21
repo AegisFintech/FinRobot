@@ -27,6 +27,9 @@ class StrategyTradeRecord:
     pnl_pct: float
     exit_reason: str
     duration: float
+    risk_amount: float = 0.0
+    r_multiple: float = 0.0
+    regime: str = "unknown"
     timestamp: float = field(default_factory=time.time)
 
 
@@ -39,8 +42,22 @@ class StrategyPerformanceTracker:
         self.parameter_snapshots: Dict[str, Dict] = {}
         self.max_trades_per_strategy = 5000
 
+        # Priors for Bayesian online edge estimation.
+        # Beta(alpha, beta) prior on win rate; alpha=beta=1 = uniform.
+        self.wr_prior_alpha = 1.0
+        self.wr_prior_beta = 1.0
+        # Normal prior on per-trade R-multiple. mu0=0 (zero edge), sigma0
+        # gives the prior some teeth so a single big winner does not blow
+        # up the posterior.
+        self.r_prior_mu = 0.0
+        self.r_prior_kappa = 4.0
+        self.r_prior_alpha = 4.0
+        self.r_prior_beta = 0.25
+
     def record_trade(self, strategy_name: str, coin: str, side: str,
-                     pnl: float, pnl_pct: float, exit_reason: str, duration: float):
+                     pnl: float, pnl_pct: float, exit_reason: str, duration: float,
+                     risk_amount: float = 0.0, r_multiple: float = 0.0,
+                     regime: str = "unknown"):
         record = StrategyTradeRecord(
             strategy_name=strategy_name,
             coin=coin,
@@ -49,6 +66,9 @@ class StrategyPerformanceTracker:
             pnl_pct=pnl_pct,
             exit_reason=exit_reason,
             duration=duration,
+            risk_amount=risk_amount,
+            r_multiple=r_multiple,
+            regime=regime,
         )
         self.trades[strategy_name].append(record)
         if len(self.trades[strategy_name]) > self.max_trades_per_strategy:
@@ -112,6 +132,108 @@ class StrategyPerformanceTracker:
             "coin_performance": coin_performance,
         }
 
+    def _filter_trades(
+        self,
+        strategy_name: str,
+        regime: Optional[str] = None,
+        coin: Optional[str] = None,
+        lookback: int = 100,
+    ) -> List["StrategyTradeRecord"]:
+        trades = self.trades.get(strategy_name, [])
+        if regime is not None:
+            trades = [t for t in trades if (t.regime or "unknown") == regime]
+        if coin is not None:
+            trades = [t for t in trades if t.coin == coin]
+        if lookback > 0:
+            trades = trades[-lookback:]
+        return trades
+
+    def get_edge_estimate(
+        self,
+        strategy_name: str,
+        regime: Optional[str] = None,
+        coin: Optional[str] = None,
+        lookback: int = 200,
+    ) -> Dict[str, float]:
+        """Posterior estimate of edge for a (strategy, regime[, coin]) slice.
+
+        Returns a dict with:
+          n               : number of trades in the slice
+          wr_mean         : posterior mean of win probability
+          wr_sample       : one Thompson sample from the win-rate posterior
+          expected_R_mean : posterior mean of per-trade R-multiple
+          expected_R_sample: one Thompson sample from the R-multiple posterior
+          confidence      : 0..1 confidence proxy = n / (n + 20)
+        """
+        trades = self._filter_trades(strategy_name, regime=regime, coin=coin, lookback=lookback)
+        n = len(trades)
+
+        wins = sum(1 for t in trades if t.pnl > 0)
+        losses = n - wins
+        alpha_post = self.wr_prior_alpha + wins
+        beta_post = self.wr_prior_beta + losses
+        wr_mean = alpha_post / (alpha_post + beta_post)
+        # Thompson sample on win rate.
+        try:
+            wr_sample = random.betavariate(alpha_post, beta_post)
+        except (ValueError, OverflowError):
+            wr_sample = wr_mean
+
+        if n > 0:
+            r_obs = [t.r_multiple if t.r_multiple else (t.pnl_pct / 100.0) for t in trades]
+            mean_obs = sum(r_obs) / n
+            var_obs = (sum((x - mean_obs) ** 2 for x in r_obs) / max(n - 1, 1)) if n > 1 else 0.0
+        else:
+            mean_obs = 0.0
+            var_obs = 0.0
+
+        # Normal-Inverse-Gamma conjugate update.
+        kappa_n = self.r_prior_kappa + n
+        mu_n = (self.r_prior_kappa * self.r_prior_mu + n * mean_obs) / kappa_n
+        alpha_n = self.r_prior_alpha + n / 2.0
+        beta_n = (
+            self.r_prior_beta
+            + 0.5 * n * var_obs
+            + 0.5 * (n * self.r_prior_kappa / max(kappa_n, 1e-9))
+            * (mean_obs - self.r_prior_mu) ** 2
+        )
+        # Posterior predictive variance of the mean R-multiple.
+        if alpha_n > 1:
+            var_mu = beta_n / ((alpha_n - 1) * max(kappa_n, 1e-9))
+        else:
+            var_mu = beta_n / max(kappa_n, 1e-9)
+        std_mu = max(var_mu, 1e-12) ** 0.5
+        expected_R_sample = random.gauss(mu_n, std_mu)
+
+        return {
+            "n": float(n),
+            "wr_mean": wr_mean,
+            "wr_sample": wr_sample,
+            "expected_R_mean": mu_n,
+            "expected_R_sample": expected_R_sample,
+            "expected_R_std": std_mu,
+            "confidence": n / (n + 20.0),
+        }
+
+    def edge_passes_hurdle(
+        self,
+        strategy_name: str,
+        regime: Optional[str] = None,
+        coin: Optional[str] = None,
+        min_trades: int = 20,
+        min_expected_R: float = 0.05,
+        min_win_rate: float = 0.40,
+        lookback: int = 200,
+    ) -> Tuple[bool, Dict[str, float]]:
+        edge = self.get_edge_estimate(strategy_name, regime=regime, coin=coin, lookback=lookback)
+        passes = (
+            edge["n"] >= min_trades
+            and edge["expected_R_mean"] >= min_expected_R
+            and edge["wr_mean"] >= min_win_rate
+        )
+        edge["passes"] = 1.0 if passes else 0.0
+        return passes, edge
+
     def get_all_performance(self, lookback: int = 100) -> Dict[str, Dict]:
         result = {}
         for strategy_name in self.trades:
@@ -144,7 +266,20 @@ class StrategyPerformanceTracker:
                 for strategy_name, trade_list in data.items():
                     self.trades[strategy_name] = []
                     for t in trade_list:
-                        self.trades[strategy_name].append(StrategyTradeRecord(**t))
+                        try:
+                            record = StrategyTradeRecord(**t)
+                        except TypeError:
+                            allowed = {
+                                "strategy_name", "coin", "side", "pnl", "pnl_pct",
+                                "exit_reason", "duration", "risk_amount",
+                                "r_multiple", "regime", "timestamp",
+                            }
+                            clean = {k: v for k, v in t.items() if k in allowed}
+                            clean.setdefault("risk_amount", 0.0)
+                            clean.setdefault("r_multiple", 0.0)
+                            clean.setdefault("regime", "unknown")
+                            record = StrategyTradeRecord(**clean)
+                        self.trades[record.strategy_name].append(record)
                 logger.info(f"Loaded strategy performance: {len(self.trades)} strategies, "
                             f"{sum(len(v) for v in self.trades.values())} trades")
         except Exception as e:
