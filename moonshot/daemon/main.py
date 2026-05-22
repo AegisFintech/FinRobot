@@ -1300,6 +1300,7 @@ class MoonshotDaemon:
         return size
 
     def check_opportunities(self):
+        self._apply_runtime_overrides()
         self.iteration_count += 1
         logger.info(f"--- Iteration {self.iteration_count} ---")
 
