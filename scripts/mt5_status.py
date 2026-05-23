@@ -3,7 +3,6 @@ from __future__ import annotations
 import json, os, time
 from pathlib import Path
 
-ROOT = Path('/home/openclaw/FinRobot')
 COMMON_CANDIDATES = [
     Path('/home/openclaw/.wine-mt5/drive_c/users/openclaw/AppData/Roaming/MetaQuotes/Terminal/Common/Files'),
     Path('/home/openclaw/.wine-mt5/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/Common/Files'),
@@ -25,6 +24,11 @@ if p:
         age = time.time() - p.stat().st_mtime
         print(json.dumps(data, indent=2))
         print(f'age_seconds={age:.1f}')
+        common = p.parent
+        for name in ('finrobot_positions.csv', 'finrobot_deals.csv', 'finrobot_acks.csv'):
+            fp = common / name
+            if fp.exists():
+                print(f'{name}: {fp} ({fp.stat().st_size} bytes, age={time.time() - fp.stat().st_mtime:.1f}s)')
     except Exception as e:
         print('read_error:', e)
 print('terminal_processes:')

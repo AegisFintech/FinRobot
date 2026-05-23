@@ -12,6 +12,3 @@ yfinance
 MetaTrader5
 ctrader-open-api
 pytest
-websocket-client
-hyperliquid-python-sdk
-eth-account

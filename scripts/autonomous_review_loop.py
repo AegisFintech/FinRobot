@@ -2,10 +2,10 @@
 """6-hour autonomous FinRobot review loop.
 
 Policy:
-- Require at least 20 closed trades in the last window before changing code/parameters.
-- Preserve memory of promoted/rejected changes.
-- Ask Opencode using the configured GPT-5.5 model to modify code locally.
-- Restart only the simple PM2-managed processes after successful checks.
+- Review MT5 XAUUSD/BTCUSD performance and strategy memory every 6 hours.
+- Require enough fresh closed trades before changing code/parameters.
+- Ask Opencode to patch the repo directly when evidence supports an improvement.
+- Keep the system MT5-demo-only until explicitly changed.
 """
 from __future__ import annotations
 
@@ -18,13 +18,17 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+try:
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / '.env')
+except Exception:
+    pass
 STATE = ROOT / 'state' / 'moonshot'
 LOG = ROOT / 'logs' / 'autonomous_review.log'
 MODEL = os.getenv('OPENCODE_REVIEW_MODEL', 'openai/gpt-5.5')
 
 sys.path.insert(0, str(ROOT))
-from moonshot.improve.analyzer import build_report
-from moonshot.improve.memory import ProposalMemory
+from moonshot.improve.memory import ProposalMemory, MemoryEntry, fingerprint
 from moonshot.improve.promoter import append_journal
 
 
@@ -40,32 +44,35 @@ def run(cmd: list[str], timeout: int = 1200) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, timeout=timeout)
 
 
-def opencode_review(report: dict, memory: list[dict], dry_run: bool) -> dict:
+def mt5_report_text() -> str:
+    cp = run([sys.executable, 'scripts/mt5_trade_report.py'], timeout=120)
+    return (cp.stdout + '\n' + cp.stderr)[-20000:]
+
+
+def opencode_review(memory: list[dict], mt5_report: str, dry_run: bool) -> dict:
     prompt = f"""
 You are a senior HFT/quant trading engineer reviewing FinRobot.
 
-Goal: improve aggressive-growth paper trading, but do not overfit. Current universe: XAUUSD plus crypto. Architecture target: Python brain + MT5 execution bridge for brokerage-realistic spread/commission/slippage; Hyperliquid paper trading remains active until MT5 bridge is fully validated.
+Current mandate:
+- Trade only two broker/demo MT5 symbols: XAUUSD and BTCUSD.
+- Stay strictly on MT5 demo execution for XAUUSD and BTCUSD only.
+- MT5 is demo-only unless the human explicitly changes that.
+- Preserve the simple PM2 process layout.
+- Use memory: keep what works, stop what does not, and do not repeat rejected ideas.
 
-Hard rules:
-- If a strategy or strategy+coin/regime has bad expectancy/profit factor/drawdown over enough trades, stop or reduce it.
-- Good strategies continue or get slightly more allocation.
-- Do not reintroduce ideas that memory says were rejected.
-- Favor simple, observable patches. Update docs when behavior changes.
-- Keep safety guards: no live-real-money execution; MT5 is demo-only until explicitly changed.
-- Preserve process simplicity: PM2 processes only.
+MT5 report:
+{mt5_report[:20000]}
 
-Recent memory:
+Recent strategy memory:
 {json.dumps(memory, indent=2)[:12000]}
-
-Performance report:
-{json.dumps(report, indent=2)[:20000]}
 
 Task:
 1. Inspect the repo.
-2. Modify code/config/docs if there is a clear improvement.
-3. Prefer parameter gating/strategy disable lists before adding complex new strategies.
-4. Run relevant syntax/tests or dry checks.
-5. Respond with exactly what changed and why.
+2. Modify code/config/docs directly if there is a clear improvement for MT5 XAUUSD/BTCUSD.
+3. Prefer simple parameter gates and symbol-specific rules before adding complexity.
+4. Keep docs current for future agents.
+5. Run syntax/tests or dry checks.
+6. Respond with exactly what changed and why.
 """
     if dry_run:
         prompt = "DRY RUN: do not edit files. Review only.\n\n" + prompt
@@ -74,27 +81,53 @@ Task:
 
 
 def cycle(args: argparse.Namespace) -> dict:
-    report = build_report(STATE, window_hours=args.window_hours).to_dict()
-    n = int((report.get('overall') or {}).get('n') or 0)
+    mt5_report = mt5_report_text()
+    closed = 0
+    try:
+        marker = 'Closed deal summary:'
+        if marker in mt5_report:
+            summary = json.loads(mt5_report.split(marker, 1)[1].split('\nRecent acknowledgements:', 1)[0].strip())
+            closed = int(summary.get('closed_deals') or 0)
+    except Exception:
+        closed = 0
+    n = closed
     memory = ProposalMemory(STATE / 'improver_memory.json')
-    log(f"window={args.window_hours}h closed_trades={n} min={args.min_trades}")
+    log(f"window={args.window_hours}h mt5_closed_deals={closed} min={args.min_trades}")
     if n < args.min_trades:
-        rec = {'ts': time.time(), 'event': 'autonomous_review_skipped', 'reason': f'insufficient_trades {n}<{args.min_trades}', 'report': report}
+        rec = {'ts': time.time(), 'event': 'autonomous_review_skipped', 'reason': f'insufficient_trades {n}<{args.min_trades}', 'mt5_report': mt5_report[-8000:]}
         append_journal(STATE / 'improver_journal.jsonl', rec)
+        memory.add(MemoryEntry(
+            ts=time.time(),
+            fingerprint=fingerprint({'event': 'mt5_review_skipped', 'closed_deals': closed}),
+            changes={'event': 'mt5_review_skipped', 'closed_deals': closed},
+            rationale=rec['reason'],
+            decision='rejected',
+            reason=rec['reason'],
+            model='autonomous-review',
+        ))
         return {'applied': False, 'skipped': True, 'reason': rec['reason']}
 
-    result = opencode_review(report, [e.short_dict() for e in memory.recent(30)], args.dry_run)
+    result = opencode_review([e.short_dict() for e in memory.recent(30)], mt5_report, args.dry_run)
     append_journal(STATE / 'improver_journal.jsonl', {'ts': time.time(), 'event': 'autonomous_opencode_review', 'result': result})
+    memory.add(MemoryEntry(
+        ts=time.time(),
+        fingerprint=fingerprint({'event': 'mt5_opencode_review', 'returncode': result['returncode']}),
+        changes={'event': 'mt5_opencode_review', 'returncode': result['returncode']},
+        rationale=(result.get('stdout') or result.get('stderr') or '')[:500],
+        decision='promoted' if result['returncode'] == 0 else 'error',
+        reason='opencode_returncode=' + str(result['returncode']),
+        model=MODEL,
+    ))
     log(f"opencode_returncode={result['returncode']}")
     if result['returncode'] == 0 and not args.dry_run:
         checks = [
             run([sys.executable, '-m', 'compileall', '-q', 'moonshot', 'finrobot', 'scripts'], timeout=300),
-            run([sys.executable, 'scripts/moonshot_health_check.py'], timeout=300),
+            run([sys.executable, 'scripts/mt5_trade_report.py'], timeout=120),
         ]
         ok = all(c.returncode == 0 for c in checks)
         log(f"post_checks_ok={ok}")
         if ok:
-            run(['runuser', '-l', 'openclaw', '-c', 'cd /home/openclaw/FinRobot && pm2 restart moonshot-daemon moonshot-dashboard'], timeout=300)
+            run(['bash', '-lc', 'pm2 restart mt5-terminal moonshot-dashboard --update-env'], timeout=300)
         return {'applied': ok, 'opencode': result}
     return {'applied': False, 'opencode': result}
 
@@ -103,10 +136,15 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument('--window-hours', type=float, default=float(os.getenv('AUTOREVIEW_WINDOW_HOURS', '6')))
     ap.add_argument('--interval-hours', type=float, default=float(os.getenv('AUTOREVIEW_INTERVAL_HOURS', '6')))
-    ap.add_argument('--min-trades', type=int, default=int(os.getenv('AUTOREVIEW_MIN_TRADES', '20')))
+    ap.add_argument('--min-trades', type=int, default=int(os.getenv('AUTOREVIEW_MIN_TRADES', '12')))
     ap.add_argument('--once', action='store_true')
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args()
+    run_on_start = os.getenv('AUTOREVIEW_RUN_ON_START', 'false').lower() in ('1', 'true', 'yes', 'on')
+    if not run_on_start and not args.once:
+        sleep_s = max(3600, args.interval_hours * 3600)
+        log(f'startup_delay_seconds={sleep_s:.0f}')
+        time.sleep(sleep_s)
     while True:
         try:
             cycle(args)
