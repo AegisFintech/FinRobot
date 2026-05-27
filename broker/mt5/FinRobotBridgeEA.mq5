@@ -1,6 +1,6 @@
 #property strict
 #property description "FinRobot MT5 bridge and demo auto trader for XAUUSD + BTCUSD."
-#property version "1.20"
+#property version "1.23"
 
 #include <Trade/Trade.mqh>
 
@@ -19,7 +19,15 @@ input ENUM_TIMEFRAMES AutoTimeframe = PERIOD_M5;
 input double XauBaseLot = 0.01;
 input double BtcBaseLot = 0.01;
 input double MaxLotPerTrade = 0.05;
-input int MaxAutoPositionsPerSymbol = 3;
+input double HighConfluenceLotMultiplier = 2.0;
+input int MinSmcConfluenceScore = 3;
+input int HighConfluenceScore = 5;
+input bool UseDailyRiskLotSizing = true;
+input double DailyRiskPerTradePct = 0.00025;
+input double DailyLossLimitPct = 0.05;
+input bool AutoClosePositionsWithoutStops = true;
+input bool DisableWeakStrategySignals = true;
+input int MaxAutoPositionsPerSymbol = 1;
 input int MinSecondsBetweenTrades = 900;
 input int FastEmaPeriod = 9;
 input int SlowEmaPeriod = 21;
@@ -30,6 +38,14 @@ input double StopAtrMultiplier = 1.2;
 input double TakeProfitAtrMultiplier = 1.8;
 input double MaxSpreadPointsXAUUSD = 80.0;
 input double MaxSpreadPointsBTCUSD = 250000.0;
+input bool EnableSmartMoneyGates = true;
+input bool EnableXauAutoTrading = false;
+input int SmcLookbackBars = 48;
+input double FvgMinAtrMultiplier = 0.15;
+input double DiscountThreshold = 0.38;
+input double PremiumThreshold = 0.62;
+input double LiquiditySweepAtrMultiplier = 0.10;
+input double MinTrendSlopeAtrMultiplier = 0.04;
 
 CTrade trade;
 int lastCommandId = 0;
@@ -38,6 +54,12 @@ int timerTicks = 0;
 string managedSymbols[];
 string lastSignals[];
 datetime lastTradeTimes[];
+int moneyManagementDay = 0;
+double dailyEquitySnapshot = 0.0;
+double todayClosedPnlCache = 0.0;
+datetime lastMoneyManagementUpdate = 0;
+string riskCloseAttemptTickets = "";
+int riskCloseAttemptDay = 0;
 
 string Trim(string s) {
    StringTrimLeft(s);
@@ -56,6 +78,190 @@ string Clean(string s) {
 string Upper(string s) {
    StringToUpper(s);
    return s;
+}
+
+bool IsBtcSymbol(string symbol) {
+   string s = Upper(symbol);
+   return StringFind(s, "BTC") >= 0;
+}
+
+bool IsXauSymbol(string symbol) {
+   string s = Upper(symbol);
+   return StringFind(s, "XAU") >= 0 || StringFind(s, "GOLD") >= 0;
+}
+
+double ClampDouble(double value, double lo, double hi) {
+   return MathMax(lo, MathMin(hi, value));
+}
+
+double RangeHigh(MqlRates &rates[], int count) {
+   int available = ArraySize(rates) - 1;
+   int n = MathMin(count, available);
+   if(n < 1) return 0.0;
+   double high = rates[1].high;
+   for(int i = 2; i <= n; i++) {
+      if(rates[i].high > high) high = rates[i].high;
+   }
+   return high;
+}
+
+double RangeLow(MqlRates &rates[], int count) {
+   int available = ArraySize(rates) - 1;
+   int n = MathMin(count, available);
+   if(n < 1) return 0.0;
+   double low = rates[1].low;
+   for(int i = 2; i <= n; i++) {
+      if(rates[i].low < low) low = rates[i].low;
+   }
+   return low;
+}
+
+double PremiumDiscountPosition(MqlRates &rates[], int count, double price) {
+   double high = RangeHigh(rates, count);
+   double low = RangeLow(rates, count);
+   if(high <= low) return 0.5;
+   return ClampDouble((price - low) / (high - low), 0.0, 1.0);
+}
+
+double PremiumDiscountPosition(string symbol, int idx) {
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int bars = CopyRates(symbol, AutoTimeframe, 0, MathMax(SmcLookbackBars + 5, 60), rates);
+   if(bars < 10) return 0.5;
+   double mid = (SymbolInfoDouble(symbol, SYMBOL_BID) + SymbolInfoDouble(symbol, SYMBOL_ASK)) * 0.5;
+   return PremiumDiscountPosition(rates, SmcLookbackBars, mid);
+}
+
+bool HasBullishFvg(MqlRates &rates[], int count, double atrValue, double price) {
+   int available = ArraySize(rates) - 3;
+   int n = MathMin(count, available);
+   double minGap = MathMax(atrValue * FvgMinAtrMultiplier, 0.0);
+   for(int i = 1; i <= n; i++) {
+      double gapLow = rates[i + 2].high;
+      double gapHigh = rates[i].low;
+      if(gapHigh > gapLow && gapHigh - gapLow >= minGap && price >= gapLow && price <= gapHigh + atrValue * 0.5) return true;
+   }
+   return false;
+}
+
+bool HasBearishFvg(MqlRates &rates[], int count, double atrValue, double price) {
+   int available = ArraySize(rates) - 3;
+   int n = MathMin(count, available);
+   double minGap = MathMax(atrValue * FvgMinAtrMultiplier, 0.0);
+   for(int i = 1; i <= n; i++) {
+      double gapLow = rates[i].high;
+      double gapHigh = rates[i + 2].low;
+      if(gapHigh > gapLow && gapHigh - gapLow >= minGap && price <= gapHigh && price >= gapLow - atrValue * 0.5) return true;
+   }
+   return false;
+}
+
+double LastBullishOrderBlockHigh(MqlRates &rates[], int count) {
+   int available = ArraySize(rates) - 2;
+   int n = MathMin(count, available);
+   for(int i = 2; i <= n; i++) {
+      if(rates[i].close < rates[i].open && rates[i - 1].close > rates[i].high) return rates[i].high;
+   }
+   return 0.0;
+}
+
+double LastBearishOrderBlockLow(MqlRates &rates[], int count) {
+   int available = ArraySize(rates) - 2;
+   int n = MathMin(count, available);
+   for(int i = 2; i <= n; i++) {
+      if(rates[i].close > rates[i].open && rates[i - 1].close < rates[i].low) return rates[i].low;
+   }
+   return 0.0;
+}
+
+bool BullishLiquiditySweep(MqlRates &rates[], int count, double atrValue) {
+   int available = ArraySize(rates) - 2;
+   int n = MathMin(count, available);
+   if(n < 5) return false;
+   double priorLow = rates[2].low;
+   for(int i = 3; i <= n; i++) {
+      if(rates[i].low < priorLow) priorLow = rates[i].low;
+   }
+   return rates[1].low < priorLow - atrValue * LiquiditySweepAtrMultiplier && rates[1].close > priorLow;
+}
+
+bool BearishLiquiditySweep(MqlRates &rates[], int count, double atrValue) {
+   int available = ArraySize(rates) - 2;
+   int n = MathMin(count, available);
+   if(n < 5) return false;
+   double priorHigh = rates[2].high;
+   for(int i = 3; i <= n; i++) {
+      if(rates[i].high > priorHigh) priorHigh = rates[i].high;
+   }
+   return rates[1].high > priorHigh + atrValue * LiquiditySweepAtrMultiplier && rates[1].close < priorHigh;
+}
+
+bool BullishStructureShift(MqlRates &rates[], int count) {
+   int available = ArraySize(rates) - 3;
+   int n = MathMin(count, available);
+   if(n < 6) return false;
+   double priorHigh = rates[2].high;
+   for(int i = 3; i <= n; i++) {
+      if(rates[i].high > priorHigh) priorHigh = rates[i].high;
+   }
+   return rates[1].close > priorHigh;
+}
+
+bool BearishStructureShift(MqlRates &rates[], int count) {
+   int available = ArraySize(rates) - 3;
+   int n = MathMin(count, available);
+   if(n < 6) return false;
+   double priorLow = rates[2].low;
+   for(int i = 3; i <= n; i++) {
+      if(rates[i].low < priorLow) priorLow = rates[i].low;
+   }
+   return rates[1].close < priorLow;
+}
+
+int SmartMoneyLongScore(MqlRates &rates[], double atrValue, double price) {
+   double pda = PremiumDiscountPosition(rates, SmcLookbackBars, price);
+   double obHigh = LastBullishOrderBlockHigh(rates, SmcLookbackBars);
+   bool discount = pda <= DiscountThreshold;
+   bool deepDiscount = pda <= MathMax(0.18, DiscountThreshold - 0.12);
+   bool hasFvg = HasBullishFvg(rates, SmcLookbackBars, atrValue, price);
+   bool reclaimedOrderBlock = obHigh > 0.0 && price >= obHigh && pda <= 0.50;
+   bool sweep = BullishLiquiditySweep(rates, SmcLookbackBars, atrValue);
+   bool structure = BullishStructureShift(rates, MathMin(SmcLookbackBars, 20));
+   int score = 0;
+   if(discount) score++;
+   if(deepDiscount) score++;
+   if(hasFvg) score++;
+   if(reclaimedOrderBlock) score++;
+   if(sweep) score++;
+   if(structure) score++;
+   return score;
+}
+
+int SmartMoneyShortScore(MqlRates &rates[], double atrValue, double price) {
+   double pda = PremiumDiscountPosition(rates, SmcLookbackBars, price);
+   double obLow = LastBearishOrderBlockLow(rates, SmcLookbackBars);
+   bool premium = pda >= PremiumThreshold;
+   bool deepPremium = pda >= MathMin(0.82, PremiumThreshold + 0.12);
+   bool hasFvg = HasBearishFvg(rates, SmcLookbackBars, atrValue, price);
+   bool rejectedOrderBlock = obLow > 0.0 && price <= obLow && pda >= 0.50;
+   bool sweep = BearishLiquiditySweep(rates, SmcLookbackBars, atrValue);
+   bool structure = BearishStructureShift(rates, MathMin(SmcLookbackBars, 20));
+   int score = 0;
+   if(premium) score++;
+   if(deepPremium) score++;
+   if(hasFvg) score++;
+   if(rejectedOrderBlock) score++;
+   if(sweep) score++;
+   if(structure) score++;
+   return score;
+}
+
+bool SmartMoneyLongOk(MqlRates &rates[], double atrValue, double price) {
+   return SmartMoneyLongScore(rates, atrValue, price) >= MinSmcConfluenceScore;
+}
+
+bool SmartMoneyShortOk(MqlRates &rates[], double atrValue, double price) {
+   return SmartMoneyShortScore(rates, atrValue, price) >= MinSmcConfluenceScore;
 }
 
 int SymbolIndex(string symbol) {
@@ -180,6 +386,7 @@ void WriteStatus() {
    payload += "\"symbol\":\"" + Clean(AutoSymbols) + "\",";
    payload += "\"last_auto_signal\":\"" + Clean(CombinedSignals()) + "\",";
    payload += "\"last_command_id\":" + IntegerToString(lastCommandId) + ",";
+   payload += "\"money_management\":" + MoneyManagementJson() + ",";
    payload += "\"symbols\":[";
    for(int i = 0; i < ArraySize(managedSymbols); i++) {
       if(i > 0) payload += ",";
@@ -193,6 +400,125 @@ void WriteStatus() {
 
 bool EnsureSymbol(string symbol) {
    return SymbolSelect(symbol, true);
+}
+
+int DayStamp(datetime value) {
+   MqlDateTime dt;
+   TimeToStruct(value, dt);
+   return dt.year * 10000 + dt.mon * 100 + dt.day;
+}
+
+bool SameDay(datetime value, int stamp) {
+   return DayStamp(value) == stamp;
+}
+
+double ManagedClosedPnlForDay(int stamp) {
+   double pnl = 0.0;
+   datetime now = TimeCurrent();
+   if(!HistorySelect(now - 86400 * 7, now)) return 0.0;
+   int total = HistoryDealsTotal();
+   for(int i = 0; i < total; i++) {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0) continue;
+      if((int)HistoryDealGetInteger(ticket, DEAL_MAGIC) != MagicNumber) continue;
+      string symbol = HistoryDealGetString(ticket, DEAL_SYMBOL);
+      if(!IsManagedSymbol(symbol)) continue;
+      datetime dealTime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      if(!SameDay(dealTime, stamp)) continue;
+      pnl += HistoryDealGetDouble(ticket, DEAL_PROFIT);
+      pnl += HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+      pnl += HistoryDealGetDouble(ticket, DEAL_SWAP);
+   }
+   return pnl;
+}
+
+void UpdateMoneyManagementState() {
+   int today = DayStamp(TimeCurrent());
+   if(moneyManagementDay != today || dailyEquitySnapshot <= 0.0) {
+      moneyManagementDay = today;
+      dailyEquitySnapshot = AccountInfoDouble(ACCOUNT_EQUITY);
+   }
+   todayClosedPnlCache = ManagedClosedPnlForDay(today);
+   lastMoneyManagementUpdate = TimeCurrent();
+}
+
+bool IsDailyLossLimitReached() {
+   double limitMoney = dailyEquitySnapshot * DailyLossLimitPct / 100.0;
+   return limitMoney > 0.0 && todayClosedPnlCache <= -limitMoney;
+}
+
+bool DailyLossLimitReached() {
+   UpdateMoneyManagementState();
+   return IsDailyLossLimitReached();
+}
+
+double DailyRiskVolume(string symbol, double slDistance, int confluenceScore) {
+   UpdateMoneyManagementState();
+   double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+   if(tickSize <= 0.0 || tickValue <= 0.0 || slDistance <= 0.0 || dailyEquitySnapshot <= 0.0) {
+      return NormalizeVolume(symbol, BaseLotForSymbol(symbol));
+   }
+   double riskMoney = dailyEquitySnapshot * DailyRiskPerTradePct / 100.0;
+   if(confluenceScore >= HighConfluenceScore) riskMoney *= MathMax(1.0, HighConfluenceLotMultiplier);
+   if(todayClosedPnlCache < 0.0) riskMoney *= 0.5;
+   double riskPerLot = (slDistance / tickSize) * tickValue;
+   if(riskPerLot <= 0.0) return NormalizeVolume(symbol, BaseLotForSymbol(symbol));
+   double volume = riskMoney / riskPerLot;
+   volume = MathMin(MaxLotPerTrade, MathMax(0.0, volume));
+   return NormalizeVolume(symbol, volume);
+}
+
+string MoneyManagementJson() {
+   UpdateMoneyManagementState();
+   string payload = "{";
+   payload += "\"day\":" + IntegerToString(moneyManagementDay) + ",";
+   payload += "\"daily_equity_snapshot\":" + DoubleToString(dailyEquitySnapshot, 2) + ",";
+   payload += "\"today_closed_pnl\":" + DoubleToString(todayClosedPnlCache, 2) + ",";
+   payload += "\"daily_risk_per_trade_pct\":" + DoubleToString(DailyRiskPerTradePct, 6) + ",";
+   payload += "\"daily_loss_limit_pct\":" + DoubleToString(DailyLossLimitPct, 4) + ",";
+   payload += "\"loss_limit_reached\":" + IntegerToString((int)IsDailyLossLimitReached()) + ",";
+   payload += "\"risk_lot_sizing\":" + IntegerToString((int)UseDailyRiskLotSizing) + ",";
+   payload += "\"auto_close_no_sl_tp\":" + IntegerToString((int)AutoClosePositionsWithoutStops);
+   payload += "}";
+   return payload;
+}
+
+bool RiskCloseAlreadyAttempted(ulong ticket) {
+   int today = DayStamp(TimeCurrent());
+   if(riskCloseAttemptDay != today) {
+      riskCloseAttemptDay = today;
+      riskCloseAttemptTickets = "";
+   }
+   string marker = "|" + IntegerToString((int)ticket) + "|";
+   if(StringFind(riskCloseAttemptTickets, marker) >= 0) return true;
+   riskCloseAttemptTickets += marker;
+   return false;
+}
+
+void EnforceManagedRisk() {
+   if(!AutoClosePositionsWithoutStops || !AllowTrading) return;
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED)) return;
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(DefaultDeviationPoints);
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      if(!IsManagedSymbol(symbol)) continue;
+      if((int)PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      double sl = PositionGetDouble(POSITION_SL);
+      double tp = PositionGetDouble(POSITION_TP);
+      string comment = PositionGetString(POSITION_COMMENT);
+      if((sl <= 0.0 || tp <= 0.0) && StringFind(comment, "FinRobot_") != 0) {
+         if(RiskCloseAlreadyAttempted(ticket)) continue;
+         bool ok = trade.PositionClose(ticket, DefaultDeviationPoints);
+         string detail = "unmanaged managed-symbol position without SL/TP: " + comment + " retcode=" + IntegerToString((int)trade.ResultRetcode()) + " " + trade.ResultRetcodeDescription();
+         AppendAck(++lastCommandId, ok ? "RISK_CLOSED" : "RISK_CLOSE_FAILED", detail, symbol, "CLOSE", PositionGetDouble(POSITION_VOLUME), PositionGetDouble(POSITION_PRICE_CURRENT));
+         Sleep(250);
+      }
+   }
 }
 
 bool CloseAllSymbolPositions(string symbol) {
@@ -280,28 +606,33 @@ void PollCommands() {
 }
 
 double BaseLotForSymbol(string symbol) {
-   string s = Upper(symbol);
-   if(StringFind(s, "BTC") >= 0) return BtcBaseLot;
+   if(IsBtcSymbol(symbol)) return BtcBaseLot;
    return XauBaseLot;
 }
 
 double MaxSpreadForSymbol(string symbol) {
-   string s = Upper(symbol);
-   if(StringFind(s, "BTC") >= 0) return MaxSpreadPointsBTCUSD;
+   if(IsBtcSymbol(symbol)) return MaxSpreadPointsBTCUSD;
    return MaxSpreadPointsXAUUSD;
 }
 
 double MinStopDistanceForSymbol(string symbol, double entry) {
-   string s = Upper(symbol);
-   if(StringFind(s, "BTC") >= 0) return MathMax(entry * 0.003, 100.0);
+   if(IsBtcSymbol(symbol)) return MathMax(entry * 0.003, 100.0);
    return MathMax(entry * 0.00045, 2.0);
 }
 
 void ManageAutoSymbol(string symbol, int idx) {
    if(!AutoTradeMT5 || !AllowTrading) return;
    if(AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) == 0 || MQLInfoInteger(MQL_TRADE_ALLOWED) == 0) return;
+   if(DailyLossLimitReached()) {
+      lastSignals[idx] = "daily_loss_limit";
+      return;
+   }
    if(!SymbolSelect(symbol, true)) {
       lastSignals[idx] = "symbol_select_failed";
+      return;
+   }
+   if(!EnableXauAutoTrading && IsXauSymbol(symbol)) {
+      lastSignals[idx] = "xau_auto_disabled negative_expectancy";
       return;
    }
 
@@ -384,6 +715,18 @@ void ManageAutoSymbol(string symbol, int idx) {
    bool macdShort = macdHist < 0 && prevMacdHist >= 0 && current < emaTrend[0] && rsi[0] > 28;
    bool rsiReversionLong = rsi[1] < 28 && rsi[0] > rsi[1] && current > previous;
    bool rsiReversionShort = rsi[1] > 72 && rsi[0] < rsi[1] && current < previous;
+   if(DisableWeakStrategySignals) {
+      if(IsBtcSymbol(symbol)) {
+         rsiReversionLong = false;
+         rsiReversionShort = false;
+      }
+      if(IsXauSymbol(symbol)) {
+         bullishCross = false;
+         bearishCross = false;
+         macdLong = false;
+         macdShort = false;
+      }
+   }
 
    int side = 0;
    string reason = "none";
@@ -395,24 +738,31 @@ void ManageAutoSymbol(string symbol, int idx) {
       reason = bearishCross ? "QuickMomentum_EMA_cross" : (macdShort ? "MACD_trend" : (rsiReversionShort ? "RSI_reversion" : "Momentum_trend"));
    }
 
+   double entry = side > 0 ? ask : bid;
+   double atrValue = atr[0] > 0 ? atr[0] : current * 0.0015;
+   double pda = PremiumDiscountPosition(rates, SmcLookbackBars, current);
+
    if(side == 0) {
-      lastSignals[idx] = "no_signal rsi=" + DoubleToString(rsi[0], 1) + " mom3=" + DoubleToString(momentum3 * 100.0, 3) + "%";
+      lastSignals[idx] = "no_signal rsi=" + DoubleToString(rsi[0], 1) + " mom3=" + DoubleToString(momentum3 * 100.0, 3) + "% pda=" + DoubleToString(pda, 2);
       return;
    }
 
-   double entry = side > 0 ? ask : bid;
-   double atrValue = atr[0] > 0 ? atr[0] : entry * 0.0015;
+   int smcScore = side > 0 ? SmartMoneyLongScore(rates, atrValue, entry) : SmartMoneyShortScore(rates, atrValue, entry);
+   if(EnableSmartMoneyGates && smcScore < MinSmcConfluenceScore) {
+      lastSignals[idx] = "smc_reject " + reason + " score=" + IntegerToString(smcScore) + " pda=" + DoubleToString(pda, 2);
+      return;
+   }
+
    double slDistance = MathMax(atrValue * StopAtrMultiplier, MinStopDistanceForSymbol(symbol, entry));
    double tpDistance = slDistance * TakeProfitAtrMultiplier;
    double sl = side > 0 ? entry - slDistance : entry + slDistance;
    double tp = side > 0 ? entry + tpDistance : entry - tpDistance;
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double volume = BaseLotForSymbol(symbol);
-   if(equity > 0) {
-      double scaled = NormalizeDouble(MathMin(MaxLotPerTrade, MathMax(BaseLotForSymbol(symbol), equity / 100000000.0)), 2);
-      volume = MathMax(volume, scaled);
-   }
+   double volume = UseDailyRiskLotSizing ? DailyRiskVolume(symbol, slDistance, smcScore) : BaseLotForSymbol(symbol);
    volume = NormalizeVolume(symbol, volume);
+   if(volume <= 0.0) {
+      lastSignals[idx] = "risk_volume_zero";
+      return;
+   }
 
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(DefaultDeviationPoints);
@@ -421,7 +771,7 @@ void ManageAutoSymbol(string symbol, int idx) {
       : trade.Sell(volume, symbol, 0.0, sl, tp, "FinRobot_" + symbol + "_" + reason);
    if(ok) {
       lastTradeTimes[idx] = TimeCurrent();
-      lastSignals[idx] = (side > 0 ? "BUY " : "SELL ") + reason + " vol=" + DoubleToString(volume, 4);
+      lastSignals[idx] = (side > 0 ? "BUY " : "SELL ") + reason + " smc=" + IntegerToString(smcScore) + " pda=" + DoubleToString(pda, 2) + " vol=" + DoubleToString(volume, 4);
       AppendAck(++lastCommandId, "AUTO_FILLED", symbol + " strategy " + lastSignals[idx], symbol, (side > 0 ? "BUY" : "SELL"), volume, entry);
    } else {
       lastSignals[idx] = "order_failed " + IntegerToString((int)trade.ResultRetcode()) + " " + trade.ResultRetcodeDescription();
@@ -498,7 +848,8 @@ int OnInit() {
    EventSetTimer(MathMax(PollSeconds, 1));
    trade.SetExpertMagicNumber(MagicNumber);
    LoadManagedSymbols();
-   Print("FinRobotBridgeEA 1.20 initialized. AutoTradeMT5=", AutoTradeMT5, " symbols=", AutoSymbols, " timeframe=", EnumToString(AutoTimeframe));
+   UpdateMoneyManagementState();
+   Print("FinRobotBridgeEA 1.23 initialized. AutoTradeMT5=", AutoTradeMT5, " symbols=", AutoSymbols, " timeframe=", EnumToString(AutoTimeframe));
    WriteStatus();
    WritePositions();
    WriteDealsHistory();
@@ -515,6 +866,7 @@ void OnDeinit(const int reason) {
 void OnTimer() {
    timerTicks++;
    PollCommands();
+   EnforceManagedRisk();
    for(int i = 0; i < ArraySize(managedSymbols); i++) {
       ManageAutoSymbol(managedSymbols[i], i);
    }

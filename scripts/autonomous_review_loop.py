@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import time
+import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,8 +41,23 @@ def log(msg: str) -> None:
         f.write(line + '\n')
 
 
+def opencode_bin() -> str:
+    candidates = [
+        shutil.which('opencode'),
+        '/home/openclaw/.npm-global/bin/opencode',
+        '/home/openclaw/.npm-global/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64/bin/opencode',
+        '/home/openclaw/.npm-global/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64-baseline/bin/opencode',
+        '/home/openclaw/.npm-global/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64-musl/bin/opencode',
+        '/home/openclaw/.npm-global/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64-baseline-musl/bin/opencode',
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return 'opencode'
+
+
 def run(cmd: list[str], timeout: int = 1200) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, timeout=timeout)
+    return subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, timeout=timeout, env={**os.environ, 'PATH': '/home/openclaw/.npm-global/bin:/home/openclaw/.npm-global/lib/node_modules/pm2/bin:' + os.environ.get('PATH', '')})
 
 
 def mt5_report_text() -> str:
@@ -76,7 +92,7 @@ Task:
 """
     if dry_run:
         prompt = "DRY RUN: do not edit files. Review only.\n\n" + prompt
-    cp = run(['opencode', 'run', '--dir', str(ROOT), '--model', MODEL, '--dangerously-skip-permissions', prompt], timeout=3600)
+    cp = run([opencode_bin(), 'run', '--dir', str(ROOT), '--model', MODEL, '--dangerously-skip-permissions', prompt], timeout=7200)
     return {'returncode': cp.returncode, 'stdout': cp.stdout[-12000:], 'stderr': cp.stderr[-12000:]}
 
 
@@ -127,7 +143,8 @@ def cycle(args: argparse.Namespace) -> dict:
         ok = all(c.returncode == 0 for c in checks)
         log(f"post_checks_ok={ok}")
         if ok:
-            run(['bash', '-lc', 'pm2 restart mt5-terminal moonshot-dashboard --update-env'], timeout=300)
+            pm2_bin = shutil.which('pm2') or '/home/openclaw/.npm-global/lib/node_modules/pm2/bin/pm2'
+            run([pm2_bin, 'restart', 'mt5-terminal', 'moonshot-dashboard', '--update-env'], timeout=300)
         return {'applied': ok, 'opencode': result}
     return {'applied': False, 'opencode': result}
 

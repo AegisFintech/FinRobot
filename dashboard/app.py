@@ -298,7 +298,7 @@ st.caption(
 with st.sidebar:
     st.markdown("### Refresh")
     st.caption("Auto-refresh is off, so the page will not jump while you read.")
-    if st.button("Refresh now", use_container_width=True):
+    if st.button("Refresh now", width="stretch"):
         st.rerun()
     if AUTO_REFRESH:
         st.warning(f"Full-page auto-refresh is enabled by env every {REFRESH_SECONDS}s.")
@@ -330,7 +330,7 @@ with command_tab:
     with left:
         st.subheader("Open managed MT5 positions")
         if not mt5_positions.empty:
-            st.dataframe(mt5_positions, use_container_width=True, hide_index=True)
+            st.dataframe(mt5_positions, width="stretch", hide_index=True)
         else:
             st.info("No managed MT5 positions exported yet.")
 
@@ -348,7 +348,7 @@ with command_tab:
             else:
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["cum_pnl"], mode="lines+markers", name="Cumulative PnL"))
             fig.update_layout(height=360, margin=dict(l=10, r=10, t=20, b=10), yaxis_title="Account currency")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.info("No closed MT5 deal data yet.")
 
@@ -368,7 +368,7 @@ with command_tab:
             if "ts" in j:
                 j["time"] = ts_to_dt(j["ts"])
                 cols = ["time"] + [c for c in cols if c != "ts"]
-            st.dataframe(j[cols].astype(str), use_container_width=True, hide_index=True)
+            st.dataframe(j[cols].astype(str), width="stretch", hide_index=True)
 
     st.markdown("### External verified performance")
     st.link_button("Open Myfxbook: Trending", MYFXBOOK_URL)
@@ -379,7 +379,7 @@ with signals_tab:
     st.caption("This collects MT5 XAUUSD/BTCUSD decisions, acknowledgements, journal lines, and autonomous-review outcomes.")
 
     st.markdown("### Current decision snapshot")
-    st.dataframe(latest_signal_snapshot(mt5_status, mt5_age, {}, overrides), use_container_width=True, hide_index=True)
+    st.dataframe(latest_signal_snapshot(mt5_status, mt5_age, {}, overrides), width="stretch", hide_index=True)
 
     st.markdown("### MT5 EA decisions")
     g1, g2, g3, g4, g5 = st.columns(5)
@@ -392,7 +392,7 @@ with signals_tab:
     ack_df = mt5_ack_table()
     if not ack_df.empty:
         st.markdown("#### MT5 EA acknowledgements / trade decisions")
-        st.dataframe(ack_df, use_container_width=True, hide_index=True)
+        st.dataframe(ack_df, width="stretch", hide_index=True)
     else:
         st.info("No MT5 acknowledgement rows yet. The live EA signal is shown above from the heartbeat.")
 
@@ -401,7 +401,7 @@ with signals_tab:
     improver_decisions = extract_decision_lines(recent_log(LOG_DIR / "improver.log", 220), "strategy-improver", 60)
     combined = pd.concat([df for df in [review_decisions, improver_decisions] if not df.empty], ignore_index=True) if (not review_decisions.empty or not improver_decisions.empty) else pd.DataFrame()
     if not combined.empty:
-        st.dataframe(combined.tail(160), use_container_width=True, hide_index=True)
+        st.dataframe(combined.tail(160), width="stretch", hide_index=True)
     else:
         st.info("No autonomous review decision lines found yet.")
 
@@ -409,7 +409,7 @@ with signals_tab:
     journal_path = latest_mt5_journal()
     mt5_decisions = extract_decision_lines(recent_utf16_log(journal_path, 300), "mt5-journal", 100) if journal_path else pd.DataFrame()
     if not mt5_decisions.empty:
-        st.dataframe(mt5_decisions, use_container_width=True, hide_index=True)
+        st.dataframe(mt5_decisions, width="stretch", hide_index=True)
     else:
         st.info("No MT5 journal decision lines found yet.")
 
@@ -433,7 +433,7 @@ with mt5_tab:
         {"field": "Last command id", "value": mt5_status.get("last_command_id", "—")},
         {"field": "Heartbeat file", "value": str(mt5_status_path or "not found")},
     ]
-    st.dataframe(pd.DataFrame(status_rows).astype(str), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(status_rows).astype(str), width="stretch", hide_index=True)
 
     col_a, col_b = st.columns([1, 1])
     with col_a:
@@ -442,13 +442,13 @@ with mt5_tab:
         pos_df = mt5_positions
         st.markdown("#### Open managed positions")
         if not pos_df.empty:
-            st.dataframe(pos_df, use_container_width=True, hide_index=True)
+            st.dataframe(pos_df, width="stretch", hide_index=True)
         else:
             st.info("No managed MT5 positions exported yet.")
         deals_df = mt5_deals
         st.markdown("#### Recent managed deals")
         if not deals_df.empty:
-            st.dataframe(deals_df.tail(80), use_container_width=True, hide_index=True)
+            st.dataframe(deals_df.tail(80), width="stretch", hide_index=True)
         else:
             st.info("No managed MT5 deals exported yet.")
     with col_b:

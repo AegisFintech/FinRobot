@@ -68,3 +68,16 @@ python3 scripts/mt5_trade_report.py
 tail -n 120 logs/autonomous_review.log
 pm2 list
 ```
+
+## Money management guardrails
+
+- `broker/mt5/FinRobotBridgeEA.mq5` must keep daily risk lot sizing enabled unless the owner explicitly disables it.
+- New trades are sized from the broker-day equity snapshot, `DailyRiskPerTradePct`, and SL distance; do not revert to fixed `0.01` lots.
+- `scripts/mt5_trade_report.py` reports total PnL, daily PnL, strategy expectancy, and the EA `money_management` status block. Check it before strategy edits.
+- Current evidence gate: BTC RSI reversion and XAUUSD quick-cross/MACD entries are disabled; do not re-enable without a stronger closed-deal sample.
+
+## Current strategy posture
+
+- Loss diagnosis from the current MT5 sample: BTCUSD is roughly breakeven/slightly positive, while XAUUSD is the dominant drawdown source. Do not re-enable XAUUSD auto trading unless a future review adds a gold-specific edge and verifies it on fresh closed deals.
+- `FinRobotBridgeEA.mq5` should keep `EnableSmartMoneyGates=true`, `EnableXauAutoTrading=false`, and `MaxAutoPositionsPerSymbol=1` unless the owner explicitly asks for more aggressive risk.
+- Smart-money gate intent: trade BTC momentum only when aligned with a 3+ ICT/SMC confluence score across premium/discount arrays, order blocks, fair-value gaps, liquidity sweeps, and structure shifts. High-confluence score 5+ entries can size up via the risk model while respecting `MaxLotPerTrade` and daily loss controls. `smc_reject score=` means the old momentum signal was intentionally blocked.

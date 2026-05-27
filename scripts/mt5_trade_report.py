@@ -46,22 +46,42 @@ def money(v) -> float:
 
 
 def summarize_deals(rows: list[dict]) -> dict:
-    exits = [r for r in rows if str(r.get('entry')) in {'1', '3'} or money(r.get('profit')) != 0]
+    entries = defaultdict(list)
+    exits = []
+    for r in rows:
+        if str(r.get('entry')) == '0':
+            entries[r.get('position_id')].append(r)
+        if str(r.get('entry')) in {'1', '3'} or money(r.get('profit')) != 0:
+            exits.append(r)
     by_symbol: dict[str, list[float]] = defaultdict(list)
+    by_strategy: dict[str, list[float]] = defaultdict(list)
+    by_day: dict[str, list[float]] = defaultdict(list)
     for r in exits:
-        by_symbol[r.get('symbol') or '?'].append(money(r.get('profit')) + money(r.get('commission')) + money(r.get('swap')))
-    out = {'closed_deals': len(exits), 'by_symbol': {}}
-    for sym, pnls in sorted(by_symbol.items()):
+        pnl = money(r.get('profit')) + money(r.get('commission')) + money(r.get('swap'))
+        sym = r.get('symbol') or '?'
+        by_symbol[sym].append(pnl)
+        by_day[(r.get('time') or '')[:10]].append(pnl)
+        entry = (entries.get(r.get('position_id')) or [{}])[0]
+        strategy = entry.get('comment') or 'UNKNOWN'
+        by_strategy[f'{sym}:{strategy}'].append(pnl)
+    def stats(pnls: list[float]) -> dict:
         wins = [p for p in pnls if p > 0]
         losses = [p for p in pnls if p <= 0]
-        out['by_symbol'][sym] = {
+        return {
             'n': len(pnls),
             'pnl': round(sum(pnls), 2),
             'win_rate': round(len(wins) / len(pnls), 4) if pnls else 0,
             'avg_win': round(mean(wins), 2) if wins else 0,
             'avg_loss': round(mean(losses), 2) if losses else 0,
+            'expectancy': round(sum(pnls) / len(pnls), 4) if pnls else 0,
         }
-    return out
+    return {
+        'closed_deals': len(exits),
+        'total_pnl': round(sum(sum(v) for v in by_symbol.values()), 2),
+        'by_symbol': {sym: stats(pnls) for sym, pnls in sorted(by_symbol.items())},
+        'by_strategy': {name: stats(pnls) for name, pnls in sorted(by_strategy.items())},
+        'by_day': {day: stats(pnls) for day, pnls in sorted(by_day.items()) if day},
+    }
 
 
 def main() -> None:
@@ -79,6 +99,9 @@ def main() -> None:
         age = time.time() - status_path.stat().st_mtime
         print(f'Heartbeat age: {age:.1f}s')
         print(json.dumps(status, indent=2))
+        mm = status.get('money_management') or {}
+        if mm:
+            print('Money management:', json.dumps(mm, indent=2))
     positions = read_csv(positions_path)
     print(f'Open managed positions: {len(positions)}')
     if positions:

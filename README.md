@@ -64,3 +64,24 @@ The autonomous review loop runs every 6 hours. On restart it waits one full inte
 - Trade only `XAUUSD` and `BTCUSD`.
 - Keep PM2 simple; do not add systemd services.
 - Never print or commit `.env` secrets.
+
+## Money management
+
+The MT5 EA uses daily risk-based lot sizing. At the start of each broker day it records an equity snapshot, sizes new trades from `DailyRiskPerTradePct` and the actual SL distance, halves risk after the day's closed PnL turns negative, caps lots with `MaxLotPerTrade`, and stops opening new trades if `DailyLossLimitPct` is hit. The status JSON includes a `money_management` block so `scripts/mt5_trade_report.py` can verify the current daily snapshot, risk setting, and closed PnL.
+
+The May 2026 audit also disabled weak live signals: BTC RSI reversion is blocked after poor closed-trade expectancy, while XAUUSD keeps only the better-performing momentum setup. The EA also makes one throttled close attempt per broker day for old managed-symbol probe positions that have the FinRobot magic number but no SL/TP, so failures cannot spam acknowledgements.
+
+## Current loss diagnosis
+
+The live MT5 report shows the 2026-05-25 drawdown is mostly XAUUSD. BTCUSD is near-flat to slightly positive over the closed sample, but XAUUSD closed with strongly negative expectancy and several same-day stop clusters. The old entry model was chasing EMA/momentum continuation without asking whether price was in discount/premium or reacting from a useful liquidity imbalance; it also allowed up to three positions per symbol, which amplified correlated losses.
+
+## Smart-money filters
+
+`FinRobotBridgeEA.mq5` now defaults to `EnableSmartMoneyGates=true`, `EnableXauAutoTrading=false`, and `MaxAutoPositionsPerSymbol=1`. BTC entries must pass a lightweight SMC gate before order placement:
+
+- Longs need discount pricing plus a 3+ point confluence score from bullish FVG, reclaimed bullish order block, liquidity sweep, structure shift, and deep discount.
+- Shorts need premium pricing plus a 3+ point confluence score from bearish FVG, rejected bearish order block, liquidity sweep, structure shift, and deep premium.
+- High-confluence entries (score 5+) can size up through the risk model via `HighConfluenceLotMultiplier`, still capped by `MaxLotPerTrade` and daily loss controls.
+- Status messages expose `pda=`, `smc=`, and `smc_reject score=` so the dashboard/performance logs show why trades were accepted or rejected.
+
+XAUUSD is paused by default until a fresh closed-deal sample justifies re-enabling it or replacing it with stricter gold-specific SMC logic.
